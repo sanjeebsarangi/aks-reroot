@@ -1,0 +1,342 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bindmount-config
+  namespace: kube-system
+data:
+  reroot: |
+    #!/bin/bash
+
+    # set -euo pipefail ( commented out due to issue at line 32 )
+
+    DISKS=/dev/nvme[0-9]*n*
+    GROUP=vgdata
+    VOLUME=lvoldata
+    DEVICE=/dev/mapper/vgdata-lvoldata
+    FORMAT=ext4
+    MOUNT=/data
+    KUBELET_ORIGINAL_POD_ROOT=/var/lib/kubelet/pods
+    KUBELET_DATA_POD_ROOT=${MOUNT}/kubelet/pods
+    STAMP=$(date "+%Y.%m.%d-%H.%M.%S")
+
+    #################################################
+    # create physical volumes
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   devices to use
+    # Returns:
+    #   None
+    #################################################
+    verf_pv () {
+
+        var=$(lsblk -n --nodeps --paths --output MOUNTPOINT $1)
+        if [[ ! -z "$var" ]]; then
+            echo "$1 is already mounted"
+            return
+        fi
+
+        var=$(pvs | grep $1)
+        if [[ -z "$var" ]]; then
+            echo "creating pv $1"
+            pvcreate $1
+            CHANGED=true
+        else
+        echo "$1 already pv exists"
+        fi
+
+    }
+
+    #################################################
+    # create logical group
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   group to create
+    #   list of pv devices to use
+    # Returns:
+    #   None
+    #################################################
+    verf_vg () {
+        var=$(vgs | grep $1)
+        if [[ -z "$var" ]]; then
+            echo "creating vg $@"
+            vgcreate $@
+            CHANGED=true
+        fi
+    }
+
+    #################################################
+    # create logical volume
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   volume to create
+    #   logical group to use
+    # Returns:
+    #   None
+    #################################################
+    verf_lv () {
+        var=$(lvs | grep $1)
+        if [[ -z "$var" ]]; then
+            echo "creating lv $1 $2"
+            lvcreate -l 100%FREE --type striped -n $1 $2
+        else
+            echo "$1 $2 lv already exists"
+        fi
+    }
+
+    #################################################
+    # format device
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   device to format
+    #   filesystem type
+    # Returns:
+    #   None
+    #################################################
+    verf_fm () {
+        var=$(lsblk -n --nodeps --paths --output FSTYPE $1)
+        if [[ ! -z "$var" ]]; then
+            if [[ "$var" != "$2" ]]; then
+                err "$1 has incorrect filesystem"
+            fi
+            return 
+        fi
+        echo "formatting $1 as $2"
+        mkfs.${2} $1
+        CHANGED=true
+    }
+
+
+    #################################################
+    # configure mount point for device
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   device to mount
+    #   path to mount device at
+    #   filesystem type
+    # Returns:
+    #   None
+    #################################################
+    verf_mt () {
+        # assert existance
+        mkdir -p $2
+
+        # verify mount state
+        array=( $(mount | grep $1 ) )
+        if [[ ${#array} > 0 ]]; then
+            if [[ "${array[2]}" != "$2" ]]; then
+                err "$1 mounted to incorrect dir"
+            fi  
+        else
+            echo "mounting $1 at $2" 
+            mount $1 $2
+            CHANGED=true
+        fi
+
+        var=$(grep $1 /etc/fstab)
+
+        # backup /etc/fstab 
+        cp -f /etc/fstab /etc/fstab-${STAMP}.bak
+        if [[ ! -z "$var" ]]; then
+            echo "updating fstab $1 at $2" 
+            sed "s~^${1}.*~${1} ${2} ${3} defaults,nofail 1 2~" -i /etc/fstab
+        else
+            echo "updating fstab $1 at $2" 
+            sed "$ a\\${1} ${2} ${3} defaults,nofail 1 2" -i /etc/fstab
+        fi
+    }
+
+    #################################################
+    # rsync from one local directory to local another
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   source directory for container workspace
+    #   target directory for container workspace
+    # Returns:
+    #   None
+    #################################################
+    verf_sync () {
+        if [ ! -d "$1" ]; then
+            echo "$1 does not exist, cannot rsync from source"
+            return
+        elif [ -z "$(ls -A $1)" ]; then
+            echo "$1 is empty, cannot rsync from source"
+            return
+        fi 
+        if [ -d "$2" ]; then
+            if [ ! -z "$(ls -A $2)" ]; then
+                echo "$1 is not empty, should not need to rsync"
+                return
+            fi
+        fi
+        mkdir -p $2
+        echo "synchronizing $1 to $2" 
+        rsync -avzhW --no-compress $1/ $2  > /var/log/rsync-${STAMP}.log 2>&1
+        CHANGED=true
+        # not deleting all content as some things are hard coded in other config files 
+        # such as /var/lib/kubelet/kubeconfig  
+        # rm -Rf $1/*
+    }
+
+    err() {
+        echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')]: $@" >&2
+        exit 1
+    }
+
+
+    #################################################
+    # configure 
+    # Globals:
+    #   CHANGED
+    # Arguments:
+    #   
+    # Returns:
+    #   None
+    #################################################
+    verf_bind () {
+
+        echo "debug, save dirs for comparison"
+
+        echo "debug, save kubeconfig, was erased on last attempt"
+        cp /var/lib/kubelet/kubeconfig /root/kubeconfig-${STAMP}.bak
+
+        rm -Rf $1/*
+        mount --bind $2 $1 > /var/log/bind-mount-${STAMP}.log 2>&1
+
+        var=$(grep $1 /etc/fstab)
+
+        # backup /etc/fstab 
+        cp -f /etc/fstab /etc/fstab-${STAMP}.bak
+
+        if [[ ! -z "$var" ]]; then
+            echo "updating fstab $1 at $2" 
+            sed "s~^${1}.*~${1} ${2} ${3} bind bind,nofail 1 2~" -i /etc/fstab
+            CHANGED=true
+        else
+            echo "updating fstab $1 at $2" 
+            sed "$ a\\${1} ${2} ${3} bind bind,nofail 1 2" -i /etc/fstab
+        fi
+    }
+
+
+    #################################################
+    # MAIN
+    #################################################
+    main () {
+
+        CHANGED=false
+
+        # verify pv 
+        # pvcreate /dev/nvme[0-9]*n*
+        for DISK in ${DISKS}; do verf_pv ${DISK}; done
+
+        # verify vg 
+        # vgcreate vgdata /dev/nvme[0-9]*n*
+        verf_vg ${GROUP} ${DISKS}
+
+        # verify lv
+        verf_lv ${VOLUME} ${GROUP}
+
+        # verf format
+        verf_fm ${DEVICE} ${FORMAT}
+
+        # mount data
+        verf_mt ${DEVICE} ${MOUNT} ${FORMAT}
+
+        # should not be symlink, not testing for -L
+        if [ "$CHANGED" == true ]; then
+
+            echo "stop docker containers if needed"
+            systemctl is-active --quiet docker || docker stop $(docker ps -a -q) 
+
+            echo "stop docker if needed"
+            systemctl is-active --quiet docker || systemctl stop docker
+
+            echo "stop kubelet if needed"
+            systemctl is-active --quiet kubelet || systemctl stop kubelet
+
+            # note, if ${KUBELET_DATA_POD_ROOT} exists, we will have already exited
+            echo "sync kubelet"
+            verf_sync ${KUBELET_ORIGINAL_POD_ROOT} ${KUBELET_DATA_POD_ROOT}
+
+            # note, if ${KUBELET_DATA_POD_ROOT} exists, we will have already exited
+            echo "bind kubelet"
+            verf_bind ${KUBELET_ORIGINAL_POD_ROOT} ${KUBELET_DATA_POD_ROOT}
+
+            systemctl daemon-reload
+            systemctl is-enabled --quiet kubelet && systemctl restart kubelet
+
+        fi
+
+        echo "ensure enable docker and kubelet"
+        systemctl is-enabled --quiet docker || systemctl enable docker
+        systemctl is-enabled --quiet kubelet || systemctl enable kubelet
+
+        echo "ensure docker and kubelet started"
+        systemctl is-active --quiet docker || systemctl start docker
+        systemctl is-active --quiet kubelet || systemctl start kubelet
+        exit 0
+    } 
+
+    main "$@"
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aks-reroot
+  namespace: kube-system
+  labels:
+    k8s-app: aks-reroot
+spec:
+  selector:
+    matchLabels:
+      name: aks-reroot
+  template:
+    metadata:
+      labels:
+        name: aks-reroot
+    spec:
+      hostPID: true # For entering the host mont namespace via init
+      initContainers:
+      - name: init
+        image: syncroswitch/aks-reroot:v0.7
+        env:
+        - name: MODE
+          value: "INIT"
+        resources:
+          limits:
+            memory: 100Mi
+          requests:
+            cpu: 10m
+            memory: 50Mi
+        securityContext:
+          privileged: true # For nsenter /proc/1/ns/mnt
+        volumeMounts:
+        - name: per-boot
+          mountPath: /app/per-boot
+        - name: config-volume
+          mountPath: /app/reroot
+          subPath: reroot
+      containers:
+      - name: aks-reroot
+        image: syncroswitch/aks-reroot:v0.7
+        resources:
+          limits:
+            memory: 100Mi
+          requests:
+            cpu: 10m
+            memory: 50Mi
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: config-volume
+        configMap:
+          name: bindmount-config
+      - name: per-boot
+        hostPath:
+          path: /var/lib/cloud/scripts/per-boot
